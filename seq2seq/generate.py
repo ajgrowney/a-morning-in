@@ -4,10 +4,10 @@ Loading and using the model to generate text
 import tensorflow as tf
 
 if __name__ == "__main__":
-    model_id = 'logic_v2'
+    model_id = 'logic_v1'
     one_step_reloaded = tf.saved_model.load(f'models/{model_id}')
-    states = None
     next_char = tf.constant(['Testing'])
+    states = one_step_reloaded.get_initial_state(next_char)
     result = [next_char]
 
     for n in range(1000):

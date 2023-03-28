@@ -5,6 +5,7 @@ dedicated to building and training the model
 import os
 import tensorflow as tf
 
+RNN_UNITS = 1024
 def load_dataset(path_to_file:str):
     """
     :return: dataset, ids_from_chars, chars_from_ids
@@ -78,8 +79,13 @@ class OneStep(tf.keras.Model):
         # Match the shape to the vocabulary
         dense_shape=[len(ids_from_chars.get_vocabulary())])
     self.prediction_mask = tf.sparse.to_dense(sparse_mask)
+  
+  @tf.function(input_signature=[tf.TensorSpec(shape=[1], dtype=tf.string)])
+  def get_initial_state(self, inputs):
+    """Generate initial state for the GRU layer"""
+    return tf.zeros(shape=(1,RNN_UNITS), dtype=tf.float32)
 
-  @tf.function
+  @tf.function(input_signature=[tf.TensorSpec(shape=[1], dtype=tf.string), tf.TensorSpec(shape=(1, RNN_UNITS), dtype=tf.float32)])
   def generate_one_step(self, inputs, states=None):
     # Convert strings to token IDs.
     input_chars = tf.strings.unicode_split(inputs, 'UTF-8')
@@ -111,17 +117,16 @@ if __name__ == "__main__":
     # ---- Dataset Selection
     dataset, ids_from_chars, chars_from_ids = load_dataset(lyrics_file)
     vocab_size = len(ids_from_chars.get_vocabulary())
+    train_batches = create_training_batches(dataset)
 
     # ---- Model Configuration
     embedding_dim = 256
-    rnn_units = 1024
     model = MyModel(vocab_size=vocab_size,
         embedding_dim=embedding_dim,
-        rnn_units=rnn_units)
+        rnn_units=RNN_UNITS)
     loss = tf.losses.SparseCategoricalCrossentropy(from_logits=True)
     model.compile(optimizer='adam', loss=loss)
     # ---- Fitting ---- 
-    dataset = create_training_batches(dataset)
 
     # Directory where the checkpoints will be saved
     checkpoint_dir = f'./training_checkpoints/{model_id}'
@@ -129,8 +134,8 @@ if __name__ == "__main__":
     checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_prefix, save_weights_only=True)
     
-    EPOCHS = 20
-    history = model.fit(dataset, epochs=EPOCHS, callbacks=[checkpoint_callback])
+    EPOCHS = 30
+    history = model.fit(train_batches, epochs=EPOCHS, callbacks=[checkpoint_callback])
     # ---- "OneStep" Model
     one_step_model = OneStep(model, chars_from_ids, ids_from_chars)
 
