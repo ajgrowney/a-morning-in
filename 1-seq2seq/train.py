@@ -49,11 +49,9 @@ class MyModel(tf.keras.Model):
                                    return_state=True)
     self.dense = tf.keras.layers.Dense(vocab_size)
 
-  def call(self, inputs, states=None, return_state=False, training=False):
+  def call(self, inputs, states, return_state=False, training=False):
     x = inputs
     x = self.embedding(x, training=training)
-    if states is None:
-      states = self.gru.get_initial_state(x)
     x, states = self.gru(x, initial_state=states, training=training)
     x = self.dense(x, training=training)
 
