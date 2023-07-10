@@ -3,18 +3,18 @@ This is the portion of the google notebook
 dedicated to building and training the model
 """
 import os
+
+import numpy as np
+import tiktoken
 import tensorflow as tf
 
 RNN_UNITS = 1024
-def load_dataset(path_to_file:str):
+def load_dataset(text:str, encoder):
     """
-    :return: dataset, ids_from_chars, chars_from_ids
+    :param text: text to load into a dataset
+    :return: dataset
     """
-    text = open(path_to_file, 'rb').read().decode(encoding='utf-8')
-    vocab = sorted(set(text))
-    ids_from_chars = tf.keras.layers.StringLookup(vocabulary=list(vocab), mask_token=None)
-    chars_from_ids = tf.keras.layers.StringLookup(vocabulary=ids_from_chars.get_vocabulary(), invert=True, mask_token=None)
-    all_ids = ids_from_chars(tf.strings.unicode_split(text, 'UTF-8'))
+    all_ids = encoder(text)
     ids_dataset = tf.data.Dataset.from_tensor_slices(all_ids)
     seq_length = 100
     sequences = ids_dataset.batch(seq_length+1, drop_remainder=True)
@@ -23,7 +23,7 @@ def load_dataset(path_to_file:str):
         target_text = sequence[1:]
         return input_text, target_text
     dataset = sequences.map(split_input_target)
-    return (dataset, ids_from_chars, chars_from_ids)
+    return (dataset)
 
 def create_training_batches(dataset, batch_size = 64, buffer_size = 1000):
     """
@@ -49,7 +49,7 @@ class MyModel(tf.keras.Model):
                                    return_state=True)
     self.dense = tf.keras.layers.Dense(vocab_size)
 
-  def call(self, inputs, states, return_state=False, training=False):
+  def call(self, inputs, states = None, return_state=False, training=False):
     x = inputs
     x = self.embedding(x, training=training)
     x, states = self.gru(x, initial_state=states, training=training)
@@ -61,34 +61,19 @@ class MyModel(tf.keras.Model):
       return x
 
 class OneStep(tf.keras.Model):
-  def __init__(self, model, chars_from_ids, ids_from_chars, temperature=1.0):
+  def __init__(self, model, prediction_mask = None, temperature=1.0):
     super().__init__()
     self.temperature = temperature
     self.model = model
-    self.chars_from_ids = chars_from_ids
-    self.ids_from_chars = ids_from_chars
-
-    # Create a mask to prevent "[UNK]" from being generated.
-    skip_ids = self.ids_from_chars(['[UNK]'])[:, None]
-    sparse_mask = tf.SparseTensor(
-        # Put a -inf at each bad index.
-        values=[-float('inf')]*len(skip_ids),
-        indices=skip_ids,
-        # Match the shape to the vocabulary
-        dense_shape=[len(ids_from_chars.get_vocabulary())])
-    self.prediction_mask = tf.sparse.to_dense(sparse_mask)
-  
-  @tf.function(input_signature=[tf.TensorSpec(shape=[1], dtype=tf.string)])
-  def get_initial_state(self, inputs):
+    self.prediction_mask = prediction_mask
+    
+  @tf.function
+  def get_initial_state(self):
     """Generate initial state for the GRU layer"""
     return tf.zeros(shape=(1,RNN_UNITS), dtype=tf.float32)
 
-  @tf.function(input_signature=[tf.TensorSpec(shape=[1], dtype=tf.string), tf.TensorSpec(shape=(1, RNN_UNITS), dtype=tf.float32)])
-  def generate_one_step(self, inputs, states=None):
-    # Convert strings to token IDs.
-    input_chars = tf.strings.unicode_split(inputs, 'UTF-8')
-    input_ids = self.ids_from_chars(input_chars).to_tensor()
-
+  @tf.function(input_signature=[tf.TensorSpec(shape=(1,1,), dtype=tf.float32), tf.TensorSpec(shape=(1, RNN_UNITS), dtype=tf.float32)])
+  def generate_one_step(self, input_ids, states=None):
     # Run the model.
     # predicted_logits.shape is [batch, char, next_char_logits]
     predicted_logits, states = self.model(inputs=input_ids, states=states,
@@ -96,34 +81,40 @@ class OneStep(tf.keras.Model):
     # Only use the last prediction.
     predicted_logits = predicted_logits[:, -1, :]
     predicted_logits = predicted_logits/self.temperature
-    # Apply the prediction mask: prevent "[UNK]" from being generated.
-    predicted_logits = predicted_logits + self.prediction_mask
+    if self.prediction_mask is not None:
+      # Apply the prediction mask: prevent "[UNK]" from being generated.
+      predicted_logits = predicted_logits + self.prediction_mask
 
     # Sample the output logits to generate token IDs.
     predicted_ids = tf.random.categorical(predicted_logits, num_samples=1)
     predicted_ids = tf.squeeze(predicted_ids, axis=-1)
 
-    # Convert from token ids to characters
-    predicted_chars = self.chars_from_ids(predicted_ids)
-
     # Return the characters and model state.
-    return predicted_chars, states
+    return predicted_ids, states
     
 if __name__ == "__main__":
-    model_id = "logic_v2"
+    # ---- Dataset Loading
+    model_id = "logic_v4"
     lyrics_file = 'data/Logic_lyrics.txt'
-    # ---- Dataset Selection
-    dataset, ids_from_chars, chars_from_ids = load_dataset(lyrics_file)
-    vocab_size = len(ids_from_chars.get_vocabulary())
+    text = open(lyrics_file, 'rb').read().decode(encoding='utf-8')
+    vocab = sorted(set(text))
+
+    # ---- Dataset Formatting
+    sw_encoder = tiktoken.get_encoding("p50k_base")
+    encoder = sw_encoder.encode
+    decoder = sw_encoder.decode
+    vocab_size = 50280
+
+    dataset = load_dataset(text, encoder)
+    
     train_batches = create_training_batches(dataset)
 
     # ---- Model Configuration
     embedding_dim = 256
     model = MyModel(vocab_size=vocab_size,
-        embedding_dim=embedding_dim,
-        rnn_units=RNN_UNITS)
-    loss = tf.losses.SparseCategoricalCrossentropy(from_logits=True)
-    model.compile(optimizer='adam', loss=loss)
+        embedding_dim=embedding_dim, rnn_units=RNN_UNITS)
+    model.compile(optimizer='adam', loss=tf.losses.SparseCategoricalCrossentropy(from_logits=True), run_eagerly = True)
+
     # ---- Fitting ---- 
 
     # Directory where the checkpoints will be saved
@@ -132,10 +123,19 @@ if __name__ == "__main__":
     checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_prefix, save_weights_only=True)
     
-    EPOCHS = 30
-    history = model.fit(train_batches, epochs=EPOCHS, callbacks=[checkpoint_callback])
+    EPOCHS = 100
+    history = model.fit(train_batches, epochs=EPOCHS, callbacks=[])
+
     # ---- "OneStep" Model
-    one_step_model = OneStep(model, chars_from_ids, ids_from_chars)
+    # Create the prediction mask to prevent "[UNK]" from being generated.
+    # skip_ids = encoder(['[UNK]'])[:, None]
+    # sparse_mask = tf.SparseTensor(
+    #     # Put a -inf at each bad index.
+    #     values=[-float('inf')]*len(skip_ids), indices=skip_ids,
+    #     # Match the shape to the vocabulary
+    #     dense_shape=[vocab_size])
+    # prediction_mask = tf.sparse.to_dense(sparse_mask)
+    one_step_model = OneStep(model, None)
 
     # ---- Saving ----
     tf.saved_model.save(one_step_model, f'models/{model_id}')
